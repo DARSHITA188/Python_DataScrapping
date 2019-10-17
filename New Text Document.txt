@@ -1,0 +1,103 @@
+#*********************************************************
+/******BDAT 1008 : Data Collection and Curation*********/
+*********************************************************
+	US Election Prediction - Random Forest
+*********************************************************
+spark-shell --master yarn --jars commons-csv-1.5.jar,spark-csv_2.10-1.5.0.jar
+
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.ml.feature.{VectorAssembler, StringIndexer}
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
+import org.apache.spark.ml.tuning.{CrossValidator, CrossValidatorModel, ParamGridBuilder}
+import org.apache.spark.ml.evaluation.{MulticlassClassificationEvaluator}
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.sql.types.{IntegerType, DoubleType}
+
+
+val results = sqlContext.read.format("com.databricks.spark.csv")
+.option("header", "true") 
+.option("inferSchema", "true")
+  .load("hdfs://localhost:8020/BDAT1008/primary_results.csv")
+
+val county = sqlContext.read.format("com.databricks.spark.csv")
+.option("header", "true") 
+.option("inferSchema", "true")
+  .load("hdfs://localhost:8020/BDAT1008/county_facts.csv")
+
+
+val results_rep = results.filter(col("party") === "Republican")
+
+//Join results with county
+val join_expr = results_rep.col("fips") === county.col("fips").cast(IntegerType)
+
+val raw_dataset = results_rep.join(county, join_expr).drop(county.col("fips")).select(
+ col("fips").alias("county_id"), 
+ col("area_name").alias("county"), 
+ col("RHI125214").cast(DoubleType).alias("white"), 
+ col("RHI725214").cast(DoubleType).alias("hispanic"), 
+ col("INC110213").cast(DoubleType).alias("income"), 
+ col("EDU685213").cast(DoubleType).alias("college"),
+ col("POP060210").cast(DoubleType).alias("pop_density"),
+ col("candidate"), 
+ col("fraction_votes").cast(DoubleType))
+
+//Group by county & Rank by votes  
+val windowSpec = Window.partitionBy(col("county_id")).orderBy(col("fraction_votes").desc)
+val ranking = rank().over(windowSpec)
+
+val dataset = raw_dataset.select(col("county_id"), col("county"), col("white"), col("hispanic"), 
+ col("income"), col("college"), col("pop_density"), col("candidate"), col("fraction_votes"), ranking.alias("rank"))
+ .filter(col("rank") === lit(1) and !(col("candidate") === lit("Ben Carson")))
+
+ 
+val Array(trainingData, testData) = dataset.randomSplit(Array(0.8, 0.2), 754) 
+
+//Index the candidate (String) column
+val indexer = new StringIndexer()
+  .setInputCol("candidate")
+  .setOutputCol("candidate_indexed")    
+
+//Assemble all features
+val assembler = new VectorAssembler()
+ .setInputCols(Array("white", "hispanic", "income", "college", "pop_density"))
+ .setOutputCol("assembled-features")
+
+//Random Forest  
+val rf = new RandomForestClassifier()
+ .setFeaturesCol("assembled-features")
+ .setLabelCol("candidate_indexed")
+ .setSeed(1234)
+  
+//Set up pipeline  
+val pipeline = new Pipeline()
+  .setStages(Array(indexer, assembler, rf))
+
+//To evaluate the model
+val evaluator = new MulticlassClassificationEvaluator()
+  .setLabelCol("candidate_indexed")
+  .setPredictionCol("prediction")
+  .setMetricName("precision")
+
+val paramGrid = new ParamGridBuilder()  
+  .addGrid(rf.maxDepth, Array(5, 10))
+  .addGrid(rf.impurity, Array("entropy")).build()
+
+//Cross validate model
+val cross_validator = new CrossValidator()
+  .setEstimator(pipeline)
+  .setEvaluator(evaluator)
+  .setEstimatorParamMaps(paramGrid)
+  .setNumFolds(3)
+
+//Train the model on training data
+val cvModel = cross_validator.fit(trainingData)
+
+//Predict with test data
+val predictions = cvModel.transform(testData)
+
+//Evaluate the model
+val accuracy = evaluator.evaluate(predictions)
+
+println("accuracy on test data = " + accuracy)
